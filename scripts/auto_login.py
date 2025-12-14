@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 ClawCloud 自动登录脚本
-- 等待设备验证（30秒）
+- 等待设备验证批准（30秒）
 - 设备验证后自动继续 OAuth 流程
 - 每次登录后自动更新 Cookie
-- 截图只通过 Telegram 发送
+- 截图直接发送 Telegram，不保存文件
+- 日志不暴露敏感信息
 """
 
 import os
@@ -21,6 +22,8 @@ DEVICE_VERIFY_WAIT = 30
 
 
 class Telegram:
+    """Telegram 通知"""
+    
     def __init__(self):
         self.token = os.environ.get('TG_BOT_TOKEN')
         self.chat_id = os.environ.get('TG_CHAT_ID')
@@ -39,6 +42,7 @@ class Telegram:
             pass
     
     def photo(self, data, caption=""):
+        """发送截图字节流"""
         if not self.ok or not data:
             return
         try:
@@ -53,23 +57,39 @@ class Telegram:
 
 
 class SecretUpdater:
+    """GitHub Secret 更新器"""
+    
     def __init__(self):
         self.token = os.environ.get('REPO_TOKEN')
         self.repo = os.environ.get('GITHUB_REPOSITORY')
         self.ok = bool(self.token and self.repo)
+        if self.ok:
+            print("✅ Secret 自动更新已启用")
+        else:
+            print("⚠️ Secret 自动更新未启用")
     
     def update(self, name, value):
         if not self.ok:
             return False
         try:
             from nacl import encoding, public
-            headers = {"Authorization": f"token {self.token}", "Accept": "application/vnd.github.v3+json"}
-            r = requests.get(f"https://api.github.com/repos/{self.repo}/actions/secrets/public-key", headers=headers, timeout=30)
+            
+            headers = {
+                "Authorization": f"token {self.token}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            
+            r = requests.get(
+                f"https://api.github.com/repos/{self.repo}/actions/secrets/public-key",
+                headers=headers, timeout=30
+            )
             if r.status_code != 200:
                 return False
+            
             key_data = r.json()
             pk = public.PublicKey(key_data['key'].encode(), encoding.Base64Encoder())
             encrypted = public.SealedBox(pk).encrypt(value.encode())
+            
             r = requests.put(
                 f"https://api.github.com/repos/{self.repo}/actions/secrets/{name}",
                 headers=headers,
@@ -77,11 +97,14 @@ class SecretUpdater:
                 timeout=30
             )
             return r.status_code in [201, 204]
-        except:
+        except Exception as e:
+            print(f"更新 Secret 失败: {e}")
             return False
 
 
 class AutoLogin:
+    """自动登录"""
+    
     def __init__(self):
         self.username = os.environ.get('GH_USERNAME')
         self.password = os.environ.get('GH_PASSWORD')
@@ -89,8 +112,7 @@ class AutoLogin:
         self.tg = Telegram()
         self.secret = SecretUpdater()
         self.logs = []
-        self.last_shot = None
-        self.oauth_url = None  # 保存 OAuth URL
+        self.last_shot = None  # 最后一张截图的字节
         
     def log(self, msg, level="INFO"):
         icons = {"INFO": "ℹ️", "SUCCESS": "✅", "ERROR": "❌", "WARN": "⚠️", "STEP": "🔹"}
@@ -99,6 +121,7 @@ class AutoLogin:
         self.logs.append(line)
     
     def shot(self, page, name):
+        """截图保存到内存"""
         try:
             self.last_shot = page.screenshot()
             self.log(f"截图: {name}")
@@ -106,6 +129,7 @@ class AutoLogin:
             pass
     
     def send_shot(self, caption=""):
+        """发送最后一张截图"""
         if self.last_shot:
             self.tg.photo(self.last_shot, caption)
     
@@ -122,6 +146,7 @@ class AutoLogin:
         return False
     
     def get_session(self, context):
+        """提取 Session Cookie"""
         try:
             for c in context.cookies():
                 if c['name'] == 'user_session' and 'github' in c.get('domain', ''):
@@ -131,13 +156,18 @@ class AutoLogin:
         return None
     
     def save_cookie(self, value):
+        """保存新 Cookie（不在日志显示）"""
         if not value:
             return
+        
+        # 日志不显示 Cookie 内容
         self.log("已获取新 Cookie", "SUCCESS")
+        
         if self.secret.update('GH_SESSION', value):
             self.log("已自动更新 GH_SESSION", "SUCCESS")
             self.tg.send("🔑 <b>Cookie 已自动更新</b>")
         else:
+            # 只通过 Telegram 私发
             self.tg.send(f"🔑 <b>新 Cookie</b>\n\n请更新 <b>GH_SESSION</b>:\n<code>{value}</code>")
             self.log("已通过 Telegram 发送 Cookie", "SUCCESS")
     
@@ -151,6 +181,7 @@ class AutoLogin:
 请在 {DEVICE_VERIFY_WAIT} 秒内批准：
 1️⃣ 检查邮箱点击链接
 2️⃣ 或在 GitHub App 批准""")
+        
         self.send_shot("设备验证页面")
         
         for i in range(DEVICE_VERIFY_WAIT):
@@ -158,7 +189,6 @@ class AutoLogin:
             if i % 5 == 0:
                 self.log(f"  等待... ({i}/{DEVICE_VERIFY_WAIT}秒)")
                 url = page.url
-                # 检查是否离开了设备验证页面
                 if 'verified-device' not in url and 'device-verification' not in url and 'sessions' not in url:
                     self.log("设备验证通过！", "SUCCESS")
                     self.tg.send("✅ <b>设备验证通过</b>")
@@ -169,7 +199,7 @@ class AutoLogin:
                 except:
                     pass
         
-        # 最后检查一次
+        # 最后检查
         url = page.url
         if 'verified-device' not in url and 'device-verification' not in url:
             self.log("设备验证通过！", "SUCCESS")
@@ -183,13 +213,6 @@ class AutoLogin:
     def login_github(self, page, context):
         """登录 GitHub"""
         self.log("登录 GitHub...", "STEP")
-        
-        # 保存当前 URL（包含 OAuth 参数）
-        current_url = page.url
-        if 'client_id' in current_url:
-            self.oauth_url = current_url
-            self.log("已保存 OAuth URL")
-        
         self.shot(page, "github_登录页")
         
         try:
@@ -223,30 +246,30 @@ class AutoLogin:
             page.wait_for_load_state('networkidle', timeout=30000)
             self.shot(page, "验证后")
             
-            # 设备验证后，需要重新访问 OAuth URL 或 ClawCloud
+            # 设备验证后，检查当前页面
             url = page.url
             self.log(f"验证后页面: {url}")
             
-            # 如果还在 GitHub 首页或其他页面，需要重新开始 OAuth 流程
+            # 如果在 GitHub 首页或其他非 OAuth 页面，需要重新开始
             if 'github.com' in url and 'oauth' not in url and 'claw' not in url:
                 self.log("重新开始 OAuth 流程...", "STEP")
                 
-                # 方法1: 直接访问 ClawCloud 登录页
+                # 重新访问 ClawCloud
                 page.goto(SIGNIN_URL, timeout=30000)
                 page.wait_for_load_state('networkidle', timeout=30000)
                 time.sleep(2)
                 self.shot(page, "重新访问clawcloud")
                 
-                # 如果已经登录了就直接返回
+                # 检查是否已登录
                 if 'signin' not in page.url.lower():
                     self.log("已自动登录 ClawCloud！", "SUCCESS")
                     return True
                 
-                # 再次点击 GitHub 登录
-                if self.click(page, ['button:has-text("GitHub")', 'a:has-text("GitHub")'], "GitHub"):
+                # 再次点击 GitHub
+                if self.click(page, ['button:has-text("GitHub")', 'a:has-text("GitHub")', '[data-provider="github"]'], "GitHub"):
                     time.sleep(3)
                     page.wait_for_load_state('networkidle', timeout=30000)
-                    self.shot(page, "再次点击github后")
+                    self.shot(page, "再次点击后")
         
         # 2FA
         if 'two-factor' in page.url:
@@ -255,7 +278,7 @@ class AutoLogin:
             self.send_shot("需要两步验证")
             return False
         
-        # 错误检查
+        # 错误
         try:
             err = page.locator('.flash-error').first
             if err.is_visible(timeout=2000):
@@ -267,61 +290,49 @@ class AutoLogin:
         return True
     
     def oauth(self, page):
-        """处理 OAuth 授权"""
+        """处理 OAuth"""
         if 'github.com/login/oauth/authorize' in page.url:
-            self.log("处理 OAuth 授权...", "STEP")
+            self.log("处理 OAuth...", "STEP")
             self.shot(page, "oauth")
-            
-            # 尝试点击授权按钮
-            clicked = self.click(page, [
-                'button[name="authorize"]',
-                'button:has-text("Authorize")',
-                'button[type="submit"]'
-            ], "授权")
-            
-            if clicked:
-                time.sleep(3)
-                page.wait_for_load_state('networkidle', timeout=30000)
-            else:
-                self.log("未找到授权按钮，可能已自动授权", "WARN")
+            self.click(page, ['button[name="authorize"]', 'button:has-text("Authorize")', 'button[type="submit"]'], "授权")
+            time.sleep(3)
+            page.wait_for_load_state('networkidle', timeout=30000)
     
     def wait_redirect(self, page, wait=60):
-        """等待重定向到 ClawCloud"""
+        """等待重定向"""
         self.log("等待重定向...", "STEP")
         
         for i in range(wait):
             url = page.url
             
-            # 成功：到达 ClawCloud 且不是登录页
+            # 成功
             if 'claw.cloud' in url and 'signin' not in url.lower():
                 self.log("重定向成功！", "SUCCESS")
                 return True
             
-            # 处理 OAuth 授权页
+            # OAuth 授权页
             if 'github.com/login/oauth/authorize' in url:
                 self.oauth(page)
                 continue
             
-            # 如果在 GitHub 首页，说明登录成功但没有继续 OAuth
-            if url == 'https://github.com/' or url == 'https://github.com':
+            # 在 GitHub 首页，重新开始
+            if url in ['https://github.com/', 'https://github.com']:
                 self.log("在 GitHub 首页，重新访问 ClawCloud...", "WARN")
                 page.goto(SIGNIN_URL, timeout=30000)
                 page.wait_for_load_state('networkidle', timeout=30000)
                 time.sleep(2)
                 
-                # 检查是否已登录
                 if 'signin' not in page.url.lower():
                     self.log("已登录 ClawCloud！", "SUCCESS")
                     return True
                 
-                # 再次点击 GitHub
                 self.click(page, ['button:has-text("GitHub")', 'a:has-text("GitHub")'], "GitHub")
                 time.sleep(3)
                 page.wait_for_load_state('networkidle', timeout=30000)
             
             time.sleep(1)
             if i % 10 == 0:
-                self.log(f"  等待... ({i}秒) - {url[:50]}")
+                self.log(f"  等待... ({i}秒)")
         
         self.log("重定向超时", "ERROR")
         return False
@@ -342,14 +353,18 @@ class AutoLogin:
     def notify(self, ok, err=""):
         if not self.tg.ok:
             return
+        
         msg = f"""<b>🤖 ClawCloud 自动登录</b>
 
 <b>状态:</b> {"✅ 成功" if ok else "❌ 失败"}
 <b>用户:</b> {self.username}
 <b>时间:</b> {time.strftime('%Y-%m-%d %H:%M:%S')}"""
+        
         if err:
             msg += f"\n<b>错误:</b> {err}"
+        
         msg += "\n\n<b>日志:</b>\n" + "\n".join(self.logs[-6:])
+        
         self.tg.send(msg)
         self.send_shot("最终截图" if ok else "错误截图")
     
@@ -361,7 +376,6 @@ class AutoLogin:
         self.log(f"用户名: {self.username}")
         self.log(f"Session: {'有' if self.gh_session else '无'}")
         self.log(f"密码: {'有' if self.password else '无'}")
-        self.log(f"Secret更新: {'启用' if self.secret.ok else '未启用'}")
         
         if not self.username or not self.password:
             self.log("缺少凭据", "ERROR")
@@ -388,7 +402,7 @@ class AutoLogin:
                     except:
                         self.log("加载 Cookie 失败", "WARN")
                 
-                # 步骤1: 访问 ClawCloud
+                # 1. 访问 ClawCloud
                 self.log("步骤1: 打开 ClawCloud", "STEP")
                 page.goto(SIGNIN_URL, timeout=60000)
                 page.wait_for_load_state('networkidle', timeout=30000)
@@ -405,9 +419,13 @@ class AutoLogin:
                     print("\n✅ 成功！\n")
                     return
                 
-                # 步骤2: 点击 GitHub
+                # 2. 点击 GitHub
                 self.log("步骤2: 点击 GitHub", "STEP")
-                if not self.click(page, ['button:has-text("GitHub")', 'a:has-text("GitHub")', '[data-provider="github"]'], "GitHub"):
+                if not self.click(page, [
+                    'button:has-text("GitHub")',
+                    'a:has-text("GitHub")',
+                    '[data-provider="github"]'
+                ], "GitHub"):
                     self.log("找不到按钮", "ERROR")
                     self.shot(page, "找不到按钮")
                     self.notify(False, "找不到 GitHub 按钮")
@@ -420,7 +438,7 @@ class AutoLogin:
                 url = page.url
                 self.log(f"当前: {url}")
                 
-                # 步骤3: GitHub 认证
+                # 3. GitHub 登录
                 self.log("步骤3: GitHub 认证", "STEP")
                 
                 if 'github.com/login' in url or 'github.com/session' in url:
@@ -432,7 +450,7 @@ class AutoLogin:
                     self.log("Cookie 有效", "SUCCESS")
                     self.oauth(page)
                 
-                # 步骤4: 等待重定向
+                # 4. 等待重定向
                 self.log("步骤4: 等待重定向", "STEP")
                 if not self.wait_redirect(page):
                     self.shot(page, "重定向失败")
@@ -441,16 +459,16 @@ class AutoLogin:
                 
                 self.shot(page, "重定向成功")
                 
-                # 步骤5: 验证
+                # 5. 验证
                 self.log("步骤5: 验证", "STEP")
                 if 'claw.cloud' not in page.url or 'signin' in page.url.lower():
                     self.notify(False, "验证失败")
                     sys.exit(1)
                 
-                # 步骤6: 保活
+                # 6. 保活
                 self.keepalive(page)
                 
-                # 步骤7: 更新 Cookie
+                # 7. 更新 Cookie
                 self.log("步骤6: 更新 Cookie", "STEP")
                 new = self.get_session(context)
                 if new:
